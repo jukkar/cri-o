@@ -19,9 +19,63 @@ import (
 
 var localRegistryPrefix = "localhost/"
 
+type progressPullInfo struct {
+	stream *types.ImageService_PullImageWithProgressServer
+	pullImageProgressGranularity types.PullImageProgressGranularity
+	pullImageProgressInterval uint32
+}
+
+// PullImageWithProgress pulls a image with authentication config and will notify the client about the pull progress.
+func (s *Server) PullImageWithProgress(req *types.PullImageWithProgressRequest, srv types.ImageService_PullImageWithProgressServer) error {
+	ctx := context.TODO()
+
+	pullReq := &types.PullImageRequest{
+		Image: req.GetImage(),
+	}
+
+	pullReq.Auth = req.GetAuth()
+	pullReq.SandboxConfig = req.GetSandboxConfig()
+
+	pullArgs, err := s.setPullArgs(ctx, pullReq)
+	if err != nil {
+		return err
+	}
+
+	progressPull := &progressPullInfo{
+		stream:                       &srv,
+		pullImageProgressGranularity: req.GetGranularityType(),
+		pullImageProgressInterval:    req.GetInterval(),
+	}
+
+	pullOp := s.doPull(ctx, pullArgs, progressPull)
+	if pullOp.err != nil {
+		return pullOp.err
+	}
+
+	log.Infof(ctx, "Pulled image: %v", pullOp.imageRef)
+	return nil
+}
+
 // PullImage pulls a image with authentication config.
 func (s *Server) PullImage(ctx context.Context, req *types.PullImageRequest) (*types.PullImageResponse, error) {
 	// TODO: what else do we need here? (Signatures when the story isn't just pulling from docker://)
+	pullArgs, err := s.setPullArgs(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	pullOp := s.doPull(ctx, pullArgs, nil)
+	if pullOp.err != nil {
+		return nil, pullOp.err
+	}
+
+	log.Infof(ctx, "Pulled image: %v", pullOp.imageRef)
+	return &types.PullImageResponse{
+		ImageRef: pullOp.imageRef,
+	}, nil
+}
+
+func (s *Server) setPullArgs(ctx context.Context, req *types.PullImageRequest) (*pullArguments, error) {
 	var err error
 	image := ""
 	img := req.Image
@@ -57,6 +111,10 @@ func (s *Server) PullImage(ctx context.Context, req *types.PullImageRequest) (*t
 		}
 	}
 
+	return &pullArgs, err
+}
+
+func (s *Server) doPull(ctx context.Context, pullArgs *pullArguments, progressPull *progressPullInfo) (*pullOperation) {
 	// We use the server's pullOperationsInProgress to record which images are
 	// currently being pulled. This allows for avoiding pulling the same image
 	// in parallel. Hence, if a given image is currently being pulled, we queue
@@ -65,12 +123,22 @@ func (s *Server) PullImage(ctx context.Context, req *types.PullImageRequest) (*t
 	pullOp, pullInProcess := func() (pullOp *pullOperation, inProgress bool) {
 		s.pullOperationsLock.Lock()
 		defer s.pullOperationsLock.Unlock()
-		pullOp, inProgress = s.pullOperationsInProgress[pullArgs]
+		pullOp, inProgress = s.pullOperationsInProgress[*pullArgs]
 		if !inProgress {
 			pullOp = &pullOperation{}
-			s.pullOperationsInProgress[pullArgs] = pullOp
+			s.pullOperationsInProgress[*pullArgs] = pullOp
 			storage.ImageBeingPulled.Store(pullArgs.image, true)
 			pullOp.wg.Add(1)
+		}
+		if progressPull != nil {
+			pullOp.imageOffset = make(map[string]uint64)
+			client := &pullImageProgressClient{
+				stream: progressPull.stream,
+				pullImageProgressGranularity: progressPull.pullImageProgressGranularity,
+				pullImageProgressInterval: progressPull.pullImageProgressInterval,
+			}
+
+			pullOp.pullImageProgressClients = append(pullOp.pullImageProgressClients, client)
 		}
 		return pullOp, inProgress
 	}()
@@ -79,25 +147,28 @@ func (s *Server) PullImage(ctx context.Context, req *types.PullImageRequest) (*t
 		pullOp.err = errors.New("pullImage was aborted by a Go panic")
 		defer func() {
 			s.pullOperationsLock.Lock()
-			delete(s.pullOperationsInProgress, pullArgs)
+			delete(s.pullOperationsInProgress, *pullArgs)
 			storage.ImageBeingPulled.Delete(pullArgs.image)
 			pullOp.wg.Done()
 			s.pullOperationsLock.Unlock()
 		}()
-		pullOp.imageRef, pullOp.err = s.pullImage(ctx, &pullArgs)
+		pullOp.imageRef, pullOp.err = s.pullImage(ctx, pullArgs)
 	} else {
 		// Wait for the pull operation to finish.
 		pullOp.wg.Wait()
 	}
 
-	if pullOp.err != nil {
-		return nil, pullOp.err
-	}
+	return pullOp
+}
 
-	log.Infof(ctx, "Pulled image: %v", pullOp.imageRef)
-	return &types.PullImageResponse{
-		ImageRef: pullOp.imageRef,
-	}, nil
+func (s *Server) maybeSendProgressReport(client *pullImageProgressClient, imageRef string, offset uint64, total uint64) {
+	var rsp types.PullImageWithProgressResponse
+
+	rsp.ImageRef = imageRef
+	rsp.Offset = &types.UInt64Value{Value: offset}
+	rsp.Total = &types.UInt64Value{Value: total}
+
+	(*client.stream).Send(&rsp)
 }
 
 // pullImage performs the actual pull operation of PullImage. Used to separate
@@ -117,13 +188,39 @@ func (s *Server) pullImage(ctx context.Context, pullArgs *pullArguments) (string
 	}
 
 	var (
-		images []string
-		pulled string
+		images     []string
+		pulled     string
+		currOffset uint64
+		imageTotal uint64
 	)
 	images, err = s.StorageImageServer().ResolveNames(s.config.SystemContext, pullArgs.image)
 	if err != nil {
 		return "", err
 	}
+
+	// Figure out the total image size if there are clients wanting this info
+	if len(s.pullOperationsInProgress[*pullArgs].pullImageProgressClients) > 0 {
+		var imgSize int64
+
+		for _, img := range images {
+			var tmpImg imageTypes.ImageCloser
+			tmpImg, err = s.StorageImageServer().PrepareImage(&sourceCtx, img)
+			if err != nil {
+				continue
+			}
+
+			size := imageSize(tmpImg)
+			if size > 0 {
+				imgSize += size
+			}
+
+			defer tmpImg.Close() // nolint:gocritic
+		}
+
+		imageTotal = uint64(imgSize)
+		log.Debugf(ctx, "Image %s: total size %d", pullArgs.image, imageTotal)
+	}
+
 	for _, img := range images {
 		var tmpImg imageTypes.ImageCloser
 		tmpImg, err = s.StorageImageServer().PrepareImage(&sourceCtx, img)
@@ -216,6 +313,16 @@ func (s *Server) pullImage(ctx context.Context, pullArgs *pullArguments) (string
 				// Metrics for size histogram
 				if p.Event == imageTypes.ProgressEventDone {
 					metrics.Instance().MetricImagePullsLayerSizeObserve(p.Artifact.Size)
+				}
+
+				if len(s.pullOperationsInProgress[*pullArgs].pullImageProgressClients) > 0 {
+					layer := p.Artifact.Digest.String()
+					currOffset += p.Offset - s.pullOperationsInProgress[*pullArgs].imageOffset[layer]
+					s.pullOperationsInProgress[*pullArgs].imageOffset[layer] = p.Offset
+
+					for _, client := range s.pullOperationsInProgress[*pullArgs].pullImageProgressClients {
+						s.maybeSendProgressReport(client, img, currOffset, imageTotal)
+					}
 				}
 			}
 		}()

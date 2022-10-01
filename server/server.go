@@ -83,6 +83,17 @@ type pullArguments struct {
 	credentials   imageTypes.DockerAuthConfig
 }
 
+type pullImageProgressClient struct {
+	// imageOffset tells where we are in the stream with this client
+	imageOffset uint64
+	// pullImageProgressGranularity tells progress report granularity type
+	pullImageProgressGranularity types.PullImageProgressGranularity
+	// pullImageProgressInterval tells progress report interval based on granularity
+	pullImageProgressInterval uint32
+	// stream identifies the client that we need to send progress information to
+	stream *types.ImageService_PullImageWithProgressServer
+}
+
 // pullOperation is used to synchronize parallel pull operations via the
 // server's pullCache.  Goroutines can block the pullOperation's waitgroup and
 // be released once the pull operation has finished.
@@ -95,6 +106,10 @@ type pullOperation struct {
 	imageRef string
 	// err is the error indicating if the pull operation has succeeded or not.
 	err error
+	// imageOffset tells how much we have downloaded of the image / layer
+	imageOffset map[string]uint64
+	// imagePullProgressClients keeps track of clients that want progress information
+	pullImageProgressClients[] *pullImageProgressClient
 }
 
 type certConfigCache struct {

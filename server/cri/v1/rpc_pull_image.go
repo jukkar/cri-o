@@ -11,3 +11,7 @@ func (s *service) PullImage(
 ) (*pb.PullImageResponse, error) {
 	return s.server.PullImage(ctx, req)
 }
+
+func (s *service) PullImageWithProgress(req *pb.PullImageWithProgressRequest, srv pb.ImageService_PullImageWithProgressServer) error {
+	return s.server.PullImageWithProgress(req, srv)
+}
